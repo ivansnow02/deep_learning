@@ -153,6 +153,12 @@ class MinibatchDiscrimination(nn.Module):
         # x shape: (batch_size, in_features)
         batch_size = x.size(0)
 
+        # 如果批次大小为1，无法进行多样性比较，直接返回原特征
+        if batch_size <= 1:
+            # 添加全零特征作为多样性特征
+            zeros = torch.zeros(batch_size, self.out_features, device=x.device)
+            return torch.cat([x, zeros], dim=1)
+
         # 计算 M = x * T
         # M shape: (batch_size, out_features * intermediate_features)
         M = x.mm(self.T)
@@ -177,12 +183,14 @@ class MinibatchDiscrimination(nn.Module):
         # similarity shape: (batch_size, batch_size, out_features)
         similarity = torch.exp(-l1_dist)
 
-        # 计算 o(x_i)_b = sum_{j=1..n, j!=i} c_b(x_i, x_j)
-        # o_b shape: (batch_size, out_features)
-        # 我们需要从总和中减去自身与自身的相似度（即对角线元素，其L1距离为0，指数为1）
-        o_b = torch.sum(similarity, dim=1) - torch.exp(
-            torch.zeros_like(l1_dist[:, :, 0])
-        )  # 减去对角线元素 (exp(0)=1)
+        # 修复维度匹配问题
+        # 创建一个与similarity形状相同的mask，对角线为0，其他为1
+        mask = 1.0 - torch.eye(batch_size, device=x.device).unsqueeze(-1).expand_as(
+            similarity
+        )
+
+        # 使用mask直接将对角线元素置为0，然后求和
+        o_b = torch.sum(similarity * mask, dim=1)
 
         # 将 o_b 与原始输入 x 连接
         # x shape: (batch_size, in_features)
@@ -495,8 +503,11 @@ def train(config):
     ).to(device)
 
     # 添加模型图到TensorBoard
-    dummy_input = torch.rand(batch_size, image_size * image_size).to(device)
-    writer.add_graph(critic, dummy_input)
+    try:
+        dummy_input = torch.rand(batch_size, image_size * image_size).to(device)
+        writer.add_graph(critic, dummy_input)
+    except Exception as e:
+        print(f"无法添加模型图到TensorBoard: {str(e)}")
 
     # 创建优化器 - 使用Adam优化器
     optC = optim.Adam(critic.parameters(), lr=lrC, betas=(0.5, 0.9))
