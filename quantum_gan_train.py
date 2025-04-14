@@ -17,13 +17,13 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pennylane as qml
-import torchvision
-import torchvision.transforms as transforms
 
 # Pytorch imports
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torchvision
+import torchvision.transforms as transforms
 from torch.utils.data import Dataset
 from torch.utils.tensorboard import SummaryWriter
 
@@ -35,14 +35,16 @@ random.seed(seed)
 
 # 确保CUDA上下文正确初始化
 if torch.cuda.is_available():
-    device = torch.device('cuda:0')
+    device = torch.device("cuda:0")
     torch.cuda.set_device(device)
     torch.cuda.empty_cache()
     # 打印CUDA内存信息
-    print(f"CUDA可用内存: {torch.cuda.get_device_properties(device).total_memory/1e9:.2f} GB")
-    print(f"已使用内存: {torch.cuda.memory_allocated(device)/1e9:.2f} GB")
+    print(
+        f"CUDA可用内存: {torch.cuda.get_device_properties(device).total_memory / 1e9:.2f} GB"
+    )
+    print(f"已使用内存: {torch.cuda.memory_allocated(device) / 1e9:.2f} GB")
 else:
-    device = torch.device('cpu')
+    device = torch.device("cpu")
 
 # 创建TensorBoard日志目录
 log_dir = os.path.join(
@@ -133,36 +135,110 @@ class DigitsDataset(Dataset):
         return image, int(self.labels[idx])
 
 
+# 定义 Minibatch Discrimination 层
+class MinibatchDiscrimination(nn.Module):
+    def __init__(self, in_features, out_features, intermediate_features=16):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.intermediate_features = intermediate_features
+
+        # 可学习的变换张量 T
+        self.T = nn.Parameter(
+            torch.Tensor(in_features, out_features * intermediate_features)
+        )
+        nn.init.normal_(self.T, 0, 1)  # 使用正态分布初始化
+
+    def forward(self, x):
+        # x shape: (batch_size, in_features)
+        batch_size = x.size(0)
+
+        # 计算 M = x * T
+        # M shape: (batch_size, out_features * intermediate_features)
+        M = x.mm(self.T)
+
+        # 将 M reshape 为 (batch_size, out_features, intermediate_features)
+        M = M.view(batch_size, self.out_features, self.intermediate_features)
+
+        # 计算 L1 距离
+        # M_expanded_1 shape: (batch_size, batch_size, out_features, intermediate_features)
+        M_expanded_1 = M.unsqueeze(1).expand(
+            batch_size, batch_size, self.out_features, self.intermediate_features
+        )
+        # M_expanded_2 shape: (batch_size, batch_size, out_features, intermediate_features)
+        M_expanded_2 = M.unsqueeze(0).expand(
+            batch_size, batch_size, self.out_features, self.intermediate_features
+        )
+
+        # L1 距离 shape: (batch_size, batch_size, out_features)
+        l1_dist = torch.sum(torch.abs(M_expanded_1 - M_expanded_2), dim=3)
+
+        # 计算相似度 c_b(x_i, x_j) = exp(-l1_dist)
+        # similarity shape: (batch_size, batch_size, out_features)
+        similarity = torch.exp(-l1_dist)
+
+        # 计算 o(x_i)_b = sum_{j=1..n, j!=i} c_b(x_i, x_j)
+        # o_b shape: (batch_size, out_features)
+        # 我们需要从总和中减去自身与自身的相似度（即对角线元素，其L1距离为0，指数为1）
+        o_b = torch.sum(similarity, dim=1) - torch.exp(
+            torch.zeros_like(l1_dist[:, :, 0])
+        )  # 减去对角线元素 (exp(0)=1)
+
+        # 将 o_b 与原始输入 x 连接
+        # x shape: (batch_size, in_features)
+        # o_b shape: (batch_size, out_features)
+        # combined shape: (batch_size, in_features + out_features)
+        combined = torch.cat([x, o_b], dim=1)
+
+        return combined
+
+
 # 定义Wasserstein GAN的Critic网络（不是判别器）
 class Critic(nn.Module):
-    """Wasserstein GAN中的评论家网络，没有sigmoid激活层"""
+    """Wasserstein GAN中的评论家网络，带有Minibatch Discrimination"""
 
-    def __init__(self, image_size=8, dropout_rate=0.3):
+    def __init__(
+        self,
+        image_size=8,
+        dropout_rate=0.3,
+        mb_out_features=5,
+        mb_intermediate_features=16,
+    ):
         super().__init__()
 
-        self.model = nn.Sequential(
+        # 定义 Minibatch Discrimination 层的输出维度
+        self.mb_out_features = mb_out_features
+
+        # 定义模型主体部分（不包括最后的线性层和 Minibatch Discrimination）
+        self.features = nn.Sequential(
             # 输入到第一个隐藏层
             nn.Linear(image_size * image_size, 128),
-            nn.LayerNorm(128),  # 层归一化比批归一化更适合小批量
+            nn.LayerNorm(128),
             nn.LeakyReLU(0.2),
             nn.Dropout(dropout_rate),
-
             # 第一个隐藏层到第二个
             nn.Linear(128, 64),
             nn.LayerNorm(64),
             nn.LeakyReLU(0.2),
             nn.Dropout(dropout_rate),
-
             # 第二个隐藏层到第三个
             nn.Linear(64, 32),
             nn.LayerNorm(32),
             nn.LeakyReLU(0.2),
-
-            # 第三个隐藏层到输出 - WGAN不使用sigmoid激活
-            nn.Linear(32, 1)
         )
 
-        # 应用谱归一化以帮助稳定训练
+        # 定义 Minibatch Discrimination 层
+        self.minibatch_discrimination = MinibatchDiscrimination(
+            in_features=32,  # 输入来自 features 模块的输出
+            out_features=self.mb_out_features,
+            intermediate_features=mb_intermediate_features,
+        )
+
+        # 定义最后的线性层
+        # 输入维度是 features 输出维度 (32) + Minibatch Discrimination 输出维度 (mb_out_features)
+        self.final_layer = nn.Linear(32 + self.mb_out_features, 1)
+
+        # 应用权重初始化
         self.apply(self._init_weights)
 
     def _init_weights(self, m):
@@ -171,9 +247,18 @@ class Critic(nn.Module):
             nn.init.orthogonal_(m.weight.data, 0.8)
             if m.bias is not None:
                 m.bias.data.fill_(0)
+        # 初始化 Minibatch Discrimination 层的参数 (如果需要特定初始化)
+        # elif isinstance(m, MinibatchDiscrimination):
+        #     nn.init.normal_(m.T, 0, 0.02) # 示例：不同的初始化
 
     def forward(self, x):
-        return self.model(x)
+        # 通过模型主体部分
+        features_out = self.features(x)
+        # 通过 Minibatch Discrimination 层
+        mb_out = self.minibatch_discrimination(features_out)
+        # 通过最后的线性层
+        output = self.final_layer(mb_out)
+        return output
 
 
 # 定义量子电路
@@ -193,7 +278,7 @@ def setup_quantum_generator(n_qubits=5, n_a_qubits=1, q_depth=6, n_generators=4)
             qml.Hadamard(wires=i)  # 创建叠加态
             qml.RY(noise[i], wires=i)
             if i % 2 == 0:  # 在偶数量子比特上添加RX门
-                qml.RX(noise[(i+1) % n_qubits], wires=i)
+                qml.RX(noise[(i + 1) % n_qubits], wires=i)
 
         # 重复参数化层
         for i in range(q_depth):
@@ -203,7 +288,7 @@ def setup_quantum_generator(n_qubits=5, n_a_qubits=1, q_depth=6, n_generators=4)
 
             # 添加RZ门增加表达能力
             for y in range(n_qubits):
-                qml.RZ(weights[i][(y+1) % n_qubits], wires=y)
+                qml.RZ(weights[i][(y + 1) % n_qubits], wires=y)
 
             # 纠缠层 - 使用CZ门创建纠缠
             for y in range(n_qubits - 1):
@@ -211,11 +296,11 @@ def setup_quantum_generator(n_qubits=5, n_a_qubits=1, q_depth=6, n_generators=4)
 
             # 添加额外的CNOT门增强纠缠
             if i % 2 == 0:
-                for y in range(0, n_qubits-1, 2):
-                    qml.CNOT(wires=[y, (y+1) % n_qubits])
+                for y in range(0, n_qubits - 1, 2):
+                    qml.CNOT(wires=[y, (y + 1) % n_qubits])
             else:
-                for y in range(1, n_qubits-1, 2):
-                    qml.CNOT(wires=[y, (y+1) % n_qubits])
+                for y in range(1, n_qubits - 1, 2):
+                    qml.CNOT(wires=[y, (y + 1) % n_qubits])
 
         return qml.probs(wires=list(range(n_qubits)))
 
@@ -268,17 +353,19 @@ class PatchQuantumGenerator(nn.Module):
 
         # 使用改进的初始化 - 使用更小的初始范围
         self.q_params = nn.ParameterList([
-            nn.Parameter(q_delta * (2 * torch.rand(q_depth * n_qubits) - 1), requires_grad=True)
+            nn.Parameter(
+                q_delta * (2 * torch.rand(q_depth * n_qubits) - 1), requires_grad=True
+            )
             for _ in range(n_generators)
         ])
 
         # 添加后处理层，提高生成图像质量
         self.post_process = nn.Sequential(
-            nn.Linear(2**(n_qubits - n_a_qubits) * n_generators, 128),
+            nn.Linear(2 ** (n_qubits - n_a_qubits) * n_generators, 128),
             nn.LayerNorm(128),
             nn.LeakyReLU(0.2),
             nn.Linear(128, 64),
-            nn.Tanh()  # 输出范围[-1,1]
+            nn.Tanh(),  # 输出范围[-1,1]
         )
 
     def forward(self, x):
@@ -313,7 +400,7 @@ def compute_gradient_penalty(critic, real_samples, fake_samples, device):
     alpha = torch.rand((real_samples.size(0), 1), device=device)
 
     # 获取真实样本和生成样本间的线性插值
-    interpolates = (alpha * real_samples + ((1 - alpha) * fake_samples))
+    interpolates = alpha * real_samples + ((1 - alpha) * fake_samples)
     interpolates.requires_grad_(True)
 
     # 计算critic对插值样本的评分
@@ -509,30 +596,54 @@ def train(config):
 
                     # 记录损失和其他指标到TensorBoard
                     writer.add_scalar("Loss/Critic", critic_loss.item(), global_step)
-                    writer.add_scalar("Loss/Generator", generator_loss.item(), global_step)
-                    writer.add_scalar("Metrics/Critic_real", critic_real.item(), global_step)
-                    writer.add_scalar("Metrics/Critic_fake", gen_score.item(), global_step)
-                    writer.add_scalar("Metrics/Gradient_penalty", gradient_penalty.item(), global_step)
-                    writer.add_scalar("LearningRate/Critic", schedulerC.get_last_lr()[0], global_step)
-                    writer.add_scalar("LearningRate/Generator", schedulerG.get_last_lr()[0], global_step)
+                    writer.add_scalar(
+                        "Loss/Generator", generator_loss.item(), global_step
+                    )
+                    writer.add_scalar(
+                        "Metrics/Critic_real", critic_real.item(), global_step
+                    )
+                    writer.add_scalar(
+                        "Metrics/Critic_fake", gen_score.item(), global_step
+                    )
+                    writer.add_scalar(
+                        "Metrics/Gradient_penalty", gradient_penalty.item(), global_step
+                    )
+                    writer.add_scalar(
+                        "LearningRate/Critic", schedulerC.get_last_lr()[0], global_step
+                    )
+                    writer.add_scalar(
+                        "LearningRate/Generator",
+                        schedulerG.get_last_lr()[0],
+                        global_step,
+                    )
 
                 # 每50次迭代生成测试图像
                 if generator_iters % 10 == 0:
                     with torch.no_grad():
                         test_images = generator(fixed_noise)
-                        test_images_2d = ((test_images.view(8, 1, image_size, image_size) + 1) / 2)  # 转换到[0,1]显示
+                        test_images_2d = (
+                            test_images.view(8, 1, image_size, image_size) + 1
+                        ) / 2  # 转换到[0,1]显示
 
                     # 保存图像到文件
-                    img_path = os.path.join(log_dir, f"generated_images_iter_{global_step}.png")
+                    img_path = os.path.join(
+                        log_dir, f"generated_images_iter_{global_step}.png"
+                    )
                     save_generated_images(test_images, img_path)
 
                     # 添加到TensorBoard
-                    img_grid = torchvision.utils.make_grid(test_images_2d, normalize=True)
-                    writer.add_image(f"Generated Images/Step {global_step}", img_grid, global_step)
+                    img_grid = torchvision.utils.make_grid(
+                        test_images_2d, normalize=True
+                    )
+                    writer.add_image(
+                        f"Generated Images/Step {global_step}", img_grid, global_step
+                    )
 
                 # 每100次生成器迭代保存检查点
                 if generator_iters % 20 == 0:
-                    checkpoint_path = os.path.join(log_dir, f"checkpoint_step_{global_step}.pt")
+                    checkpoint_path = os.path.join(
+                        log_dir, f"checkpoint_step_{global_step}.pt"
+                    )
                     torch.save(
                         {
                             "global_step": global_step,
@@ -561,12 +672,12 @@ def train(config):
 
     # 保存损失曲线图
     plt.figure(figsize=(10, 5))
-    plt.plot(critic_losses, label='Critic Loss')
-    plt.plot(generator_losses, label='Generator Loss')
-    plt.xlabel('Iterations')
-    plt.ylabel('Loss')
+    plt.plot(critic_losses, label="Critic Loss")
+    plt.plot(generator_losses, label="Generator Loss")
+    plt.xlabel("Iterations")
+    plt.ylabel("Loss")
     plt.legend()
-    plt.title('Training Losses')
+    plt.title("Training Losses")
     plt.savefig(os.path.join(log_dir, "training_losses.png"))
     plt.close()
 
@@ -592,20 +703,20 @@ if __name__ == "__main__":
     #     "n_critic": 5,                   # 每训练一次生成器，训练critic的次数
     #     "lambda_gp": 10,                 # 梯度惩罚系数
     # }
-    # 修改配置参数
+    # 修改配置参数以尝试缓解模式坍塌
     config = {
         "image_size": 8,
         "batch_size": 8,
         "digit_label": 4,
-        "n_qubits": 4,        # 减少量子位数
+        "n_qubits": 4,  # 减少量子位数
         "n_a_qubits": 1,
-        "q_depth": 4,         # 减少电路深度
-        "n_generators": 2,    # 减少生成器数量
+        "q_depth": 4,  # 减少电路深度
+        "n_generators": 2,  # 减少生成器数量
         "lrG": 1e-4,
         "lrC": 1e-4,
         "num_iter": 1200,
-        "n_critic": 5,
-        "lambda_gp": 10,
+        "n_critic": 3,  # 减少Critic更新频率
+        "lambda_gp": 1,  # 调整梯度惩罚系数
     }
 
     train(config)
